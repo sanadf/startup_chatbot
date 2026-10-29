@@ -1,93 +1,84 @@
+"""Conversational Streamlit interface for ArabiAgent."""
 
-import json
+from __future__ import annotations
+
 import os
+from urllib.parse import urlparse
 
 import httpx
 import streamlit as st
 from dotenv import load_dotenv
 
-from sse_client import iter_research_events
-from pdf_report import build_investment_pdf
+try:
+    from frontend.chat_state import apply_scan_event, create_scan_entry, fail_scan, report_json
+    from frontend.pdf_report import build_investment_pdf
+    from frontend.sse_client import iter_research_events
+except ModuleNotFoundError:  # `streamlit run frontend/app.py`
+    from chat_state import apply_scan_event, create_scan_entry, fail_scan, report_json
+    from pdf_report import build_investment_pdf
+    from sse_client import iter_research_events
 
 load_dotenv()
 API_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
-
 PRESET_ATTRIBUTES = [
-    "Company Name",
-    "Description",
-    "Website",
-    "Year Founded",
-    "Founders",
+    "Company Name", "Description", "Website", "Year Founded", "Founders",
+    "Headquarters", "Operating Countries", "Industry", "Funding Stage",
+    "Total Funding", "Latest Funding Round", "Revenue", "Investors",
+    "Annual Recurring Revenue (ARR)", "Employee Count", "Products / Services",
+    "Business Model", "LinkedIn", "Competitive Advantage",
+]
+DEFAULT_ATTRIBUTES = [
+    "Company Name", "Website", "Founders", "Year Founded", "Funding Stage",
     "Headquarters",
-    "Operating Countries",
-    "Industry",
-    "Funding Stage",
-    "Total Funding",
-    "Latest Funding Round",
-    "Investors",
-    "Annual Recurring Revenue (ARR)",
-    "Employee Count",
-    "Products / Services",
-    "Business Model",
-    "LinkedIn",
-    "Competitive Advantage",
 ]
 
-st.set_page_config(
-    page_title="ArabiAgent | Investment Sourcing",
-    page_icon="🔎",
-    layout="wide",
-)
 
-for key, default in {
-    "thesis": "",
-    "report": None,
-    "enhanced": None,
-    "enhance_error": None,
-    "scan_history": [],
-    "scan_error": None,
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+def initialize_state() -> None:
+    for key, default in {
+        "thesis": "", "research_attributes": DEFAULT_ATTRIBUTES,
+        "conversations": [],
+    }.items():
+        if key not in st.session_state:
+            st.session_state[key] = default
 
 
-def enhance_thesis() -> None:
-    """Update the editable investment thesis from the CrewAI endpoint."""
-    thesis = st.session_state["thesis"].strip()
-    if len(thesis) < 10:
-        st.session_state["enhance_error"] = "Please enter at least 10 characters."
-        return
-
-    try:
-        response = httpx.post(
-            f"{API_URL}/api/enhance-query",
-            json={"thesis": thesis},
-            timeout=180,
-        )
-        response.raise_for_status()
-        enhanced = response.json()
-        text = enhanced["enhanced_query"]
-        if not isinstance(text, str) or len(text.strip()) < 10:
-            raise ValueError("Invalid enhanced query from backend")
-        st.session_state["thesis"] = text
-        st.session_state["enhanced"] = enhanced
-        st.session_state["enhance_error"] = None
-    except (httpx.HTTPError, ValueError, KeyError) as exc:
-        st.session_state["enhance_error"] = str(exc)
+def split_attribute_values(values: list[str]) -> list[str]:
+    """Split selected tags and comma-pasted values into individual names."""
+    return [
+        part.strip()
+        for value in values
+        for part in str(value).split(",")
+        if part.strip()
+    ]
 
 
-def validate_scan(
-    thesis: str,
-    selected: list[str],
-    custom_input: str,
-) -> tuple[list[str], str | None]:
-    """Check user inputs before consuming Linkup credits."""
-    custom = [part.strip() for part in custom_input.split(",") if part.strip()]
-    attributes = selected + custom
+def normalize_attributes(values: list[str]) -> list[str]:
+    """Trim and case-insensitively deduplicate unified attribute values."""
+    normalized = []
+    seen = set()
+    for name in split_attribute_values(values):
+        key = name.casefold()
+        if key not in seen:
+            normalized.append(name)
+            seen.add(key)
+    return normalized
 
+
+def normalize_attribute_tags() -> None:
+    """Turn comma-pasted selections into separate removable tags."""
+    st.session_state["research_attributes"] = normalize_attributes(
+        st.session_state.get("research_attributes", [])
+    )
+
+
+def validate_scan(thesis: str, selected: list[str]) -> tuple[list[str], str | None]:
+    raw_attributes = split_attribute_values(selected)
+    attributes = normalize_attributes(selected)
+    preset_names = {name.casefold() for name in PRESET_ATTRIBUTES}
+    custom_count = sum(name.casefold() not in preset_names for name in attributes)
     if len(thesis.strip()) < 10:
         return [], "Enter an investment thesis first."
-    if len(custom) > 20:
+    if custom_count > 20:
         return [], "Maximum 20 custom attributes allowed."
     if not attributes:
         return [], "Select at least one startup attribute."
@@ -95,270 +86,297 @@ def validate_scan(
         return [], "Too many attributes selected."
     if any(len(name) > 100 for name in attributes):
         return [], "Attribute names must be 100 characters or fewer."
-    if len({name.casefold() for name in attributes}) != len(attributes):
+    if len({name.casefold() for name in raw_attributes}) != len(raw_attributes):
         return [], "Duplicate attributes are not allowed."
-
     return attributes, None
 
 
-def run_streamed_scan(payload: dict) -> None:
-    """Consume real FastAPI SSE events and retain the final report."""
-    st.session_state["report"] = None
-    st.session_state["scan_history"] = []
-    st.session_state["scan_error"] = None
-
-    progress = st.progress(0, text="Starting investment scan...")
-    activity = st.empty()
-    history: list[str] = []
-    completed = 0
-    total = 0
-    got_final_report = False
-
-    try:
-        for event, data in iter_research_events(API_URL, payload):
-            if event == "scan_started":
-                history.append("🔎 Scanning the startup market...")
-                progress.progress(5, text="Discovering startups...")
-
-            elif event == "companies_discovered":
-                total = int(data.get("total", 0))
-                history.append(f"✅ Found {total} potential startups")
-                progress.progress(10, text=f"Found {total} startups")
-
-            elif event == "company_analysis_started":
-                history.append(f"🔬 Analyzing {data.get('company', 'startup')}...")
-
-            elif event == "crewai_review_started":
-                history.append(f"🤖 CrewAI reviewing {data.get('company', 'startup')}...")
-
-            elif event in {"company_analysis_completed", "company_analysis_failed"}:
-                completed = int(data.get("completed", completed + 1))
-                name = data.get("company", "startup")
-                if event == "company_analysis_failed":
-                    history.append(f"⚠️ Research failed: {name}")
-                else:
-                    history.append(f"✅ Analyzed {name}")
-                percentage = min(95, 10 + int(85 * completed / max(total, 1)))
-                progress.progress(
-                    percentage,
-                    text=f"Analyzed {completed}/{total} startups",
-                )
-
-            elif event == "scan_completed":
-                report = data.get("report")
-                if not isinstance(report, dict) or not isinstance(report.get("results"), list):
-                    raise ValueError("The backend returned an invalid final report")
-                st.session_state["report"] = report
-                progress.progress(100, text="Research complete")
-                history.append("🎉 Investment scan finished!")
-                got_final_report = True
-
-            elif event == "scan_failed":
-                raise RuntimeError(data.get("message", "Investment scan failed"))
-
-            st.session_state["scan_history"] = history.copy()
-            activity.text("\n".join(history[-10:]))
-
-        if not got_final_report:
-            raise RuntimeError("Stream ended without a final report")
-
-    except (httpx.HTTPError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
-        st.session_state["scan_error"] = str(exc)
-        history.append("❌ Investment scan failed")
-        st.session_state["scan_history"] = history.copy()
-        activity.text("\n".join(history[-10:]))
-        st.error(f"Research failed: {exc}")
+def is_url(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
-def render_report(report: dict) -> None:
-    """Show company comparisons, evidence, analyst reviews, and JSON download."""
-    results = report.get("results", [])
-    successful = sum(1 for item in results if not item.get("error"))
-    failed = len(results) - successful
+def render_source(label: str, value: object) -> None:
+    if is_url(value):
+        st.markdown(f"[{label}]({value})")
 
-    if failed:
-        st.warning(f"Research finished: {successful} successful, {failed} failed.")
-    elif successful:
-        st.success(f"Research completed: {successful} startup profiles.")
-    else:
-        st.info("Research completed, but no startup profiles were found.")
 
+def comparison_rows(report: dict) -> list[dict]:
     rows = []
-    for item in results:
-        company = item.get("company", {})
-        website = company.get("website", "") or ""
+    for item in report.get("results", []) or []:
+        if not isinstance(item, dict):
+            continue
+        company = item.get("company") or {}
         row = {
             "Company": company.get("name", "Unknown"),
-            "Status": "Failed" if item.get("error") else "Completed",
-            "Funding Match": (
-                item.get("stage_status", "not_evaluated").replace("_", " ").title()
-            ),
-            "Website": website if website.startswith(("https://", "http://")) else "",
+            "Website": company.get("website", ""),
             "Funding Stage": company.get("funding_stage", ""),
+            "Qualification": str(item.get("stage_status", "not_evaluated"))
+            .replace("_", " ").title(),
+            "Research": "Incomplete" if item.get("error") else "Complete",
         }
-        for fact in item.get("attributes", []):
-            name = fact.get("name", "")
+        for fact in item.get("attributes", []) or []:
+            if not isinstance(fact, dict) or not fact.get("name"):
+                continue
+            name = fact["name"]
             value = fact.get("value", "Not publicly verified")
             if name == "Company Name":
                 continue
-            if name == "Website":
-                if isinstance(value, str) and value.startswith(("https://", "http://")):
-                    row["Website"] = value
-                continue
-            if value == "Research failed" and name in row:
-                continue
-            if name:
+            if name == "Website" and is_url(value):
+                row["Website"] = value
+            elif name not in row:
                 row[name] = value
         rows.append(row)
+    return rows
 
+
+def render_report(report: dict, entry_id: str) -> None:
+    results = report.get("results", []) or []
+    successful = sum(isinstance(item, dict) and not item.get("error") for item in results)
+    failed = len(results) - successful
+    matches = sum(
+        isinstance(item, dict) and item.get("stage_status") == "match"
+        for item in results
+    )
+    st.markdown("### Investment research report")
+    st.markdown("#### Executive overview")
+    st.markdown(f"**Original investment thesis**  \n{report.get('thesis', 'Not specified')}")
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Researched", len(results))
+    metric_cols[1].metric("Completed", successful)
+    metric_cols[2].metric("Incomplete", failed)
+    metric_cols[3].metric("Funding matches", matches)
+
+    st.markdown("#### Startup comparison")
+    rows = comparison_rows(report)
     if rows:
         st.dataframe(
-            rows,
-            width="stretch",
-            hide_index=True,
+            rows, width="stretch", hide_index=True,
             column_config={"Website": st.column_config.LinkColumn("Website")},
         )
+    else:
+        st.info("No startup profiles were returned for this thesis.")
 
-    st.subheader("Individual Company Profiles")
-    for item in results:
-        company = item.get("company", {})
-        with st.expander(company.get("name", "Unknown company")):
+    st.markdown("#### Individual startup profiles")
+    for index, item in enumerate(results):
+        if not isinstance(item, dict):
+            st.warning("A malformed startup profile was retained in the report.")
+            continue
+        company = item.get("company") or {}
+        name = company.get("name", "Unknown company")
+        status = "incomplete" if item.get("error") else "complete"
+        with st.expander(f"{name} · {status}", expanded=index == 0):
+            st.write(company.get("description") or "Not publicly verified")
+            details = {
+                "Website": company.get("website") or "Not publicly verified",
+                "Funding stage": company.get("funding_stage") or "Not publicly verified",
+                "Funding-stage qualification": str(
+                    item.get("stage_status", "not_evaluated")
+                ).replace("_", " ").title(),
+                "Funding-stage explanation": item.get("stage_reason") or "Not provided",
+            }
+            for label, value in details.items():
+                st.markdown(f"**{label}:** {value}")
             if item.get("error"):
-                st.warning(f"Research incomplete: {item['error']}")
-            st.write(company.get("description", ""))
+                st.warning(f"Research issue: {item['error']}")
 
-            if item.get("stage_reason"):
-                st.caption(item["stage_reason"])
+            st.markdown("##### Requested research attributes")
+            facts = item.get("attributes", []) or []
+            if not facts:
+                st.write("No attribute results were returned.")
+            for fact in facts:
+                if not isinstance(fact, dict):
+                    st.write(str(fact))
+                    continue
+                st.markdown(
+                    f"**{fact.get('name', 'Attribute')}:** "
+                    f"{fact.get('value', 'Not publicly verified')}"
+                )
+                render_source("View attribute source", fact.get("source_url"))
 
             review = item.get("analyst_review")
             if isinstance(review, dict):
-                st.markdown("#### CrewAI Analyst Review")
-                st.write(review.get("summary", ""))
-                for risk in review.get("red_flags", []):
-                    st.warning(risk)
-                questions = review.get("follow_up_questions", [])
+                st.markdown("##### CrewAI analyst review")
+                st.write(review.get("summary") or "No analyst summary provided.")
+                st.markdown("**Potential risks and evidence gaps**")
+                risks = review.get("red_flags", []) or []
+                if risks:
+                    for risk in risks:
+                        st.markdown(f"- {risk}")
+                else:
+                    st.write("None reported.")
+                st.markdown("**Follow-up due diligence questions**")
+                questions = review.get("follow_up_questions", []) or []
                 if questions:
-                    st.markdown("**Follow-up Due Diligence**")
                     for question in questions:
-                        st.write(f"• {question}")
+                        st.markdown(f"- {question}")
+                else:
+                    st.write("None reported.")
+            elif review is not None:
+                st.write("CrewAI analyst review:", review)
+            render_source("Original Linkup discovery source", company.get("source_url"))
 
-            discovery_url = company.get("source_url", "") or ""
-            if discovery_url.startswith(("https://", "http://")):
-                st.write("Discovery source:", discovery_url)
-
-            for fact in item.get("attributes", []):
-                st.write(f"{fact.get('name', 'Attribute')}: {fact.get('value', '')}")
-                source = fact.get("source_url", "") or ""
-                if source.startswith(("https://", "http://")):
-                    st.write("Source:", source)
-
+    st.markdown("#### Download report")
+    pdf_col, json_col = st.columns(2)
     try:
-        pdf_bytes = build_investment_pdf(report)
-        st.download_button(
-            "📄 Download PDF Investment Report",
-            data=pdf_bytes,
-            file_name="arabiagent_investment_report.pdf",
-            mime="application/pdf",
-            use_container_width=True,
+        pdf_col.download_button(
+            "Download PDF Report", data=build_investment_pdf(report),
+            file_name=f"arabiagent-{entry_id[:8]}.pdf", mime="application/pdf",
+            width="stretch", key=f"pdf-{entry_id}",
         )
     except Exception as exc:
-        st.warning(f"PDF export could not be generated: {exc}")
-
-    st.download_button(
-        "📥 Download JSON Report",
-        data=json.dumps(report, indent=2, ensure_ascii=False),
-        file_name="arabiagent_report.json",
-        mime="application/json",
-        use_container_width=True,
+        pdf_col.warning(f"PDF export could not be generated: {exc}")
+    json_col.download_button(
+        "Download JSON Report", data=report_json(report),
+        file_name=f"arabiagent-{entry_id[:8]}.json", mime="application/json",
+        width="stretch", key=f"json-{entry_id}",
     )
     st.caption(
-        "Information comes from public sources. Funding claims and other facts "
-        "should be independently verified before investing."
+        "Based on public sources and AI analysis. Independently verify funding, "
+        "financial claims, and other facts before investing."
     )
 
 
-# -------------------- Layout --------------------
-st.title("🔎 ArabiAgent")
-st.caption("AI-Powered Investment Sourcing | LangGraph + CrewAI + Linkup")
-st.divider()
+def render_activity(entry: dict, live: bool = False) -> None:
+    events = entry.get("events", [])
+    if events:
+        for item in events:
+            st.write(item.get("message", ""))
+    elif live:
+        st.write("Connecting to the research service…")
 
-left, right = st.columns([1, 1.3], gap="large")
 
-with left:
-    st.subheader("Investment Search Criteria")
-    st.text_area(
-        "Describe Your Investment Thesis",
-        key="thesis",
-        height=170,
-        max_chars=3000,
-        placeholder=(
-            "Example: Agentic AI startups in healthcare, $5M+ ARR, "
-            "Series A or B, operating in Saudi Arabia."
-        ),
+def run_streamed_scan(entry: dict, status_slot) -> None:
+    """Consume one SSE stream and update only its conversation entry."""
+    progress_slot = st.empty()
+    try:
+        for event, data in iter_research_events(API_URL, entry["request"]):
+            apply_scan_event(entry, event, data)
+            latest = entry["events"][-1]["message"] if entry["events"] else "Researching"
+            status_slot.info(latest)
+            progress_slot.empty()
+            with progress_slot.container():
+                render_activity(entry, live=True)
+        if entry["status"] == "running":
+            raise RuntimeError("Stream ended without a final report")
+        if entry["status"] == "failed":
+            status_slot.error("Scan failed")
+            st.error(f"Research failed: {entry['error']}")
+    except (httpx.HTTPError, ValueError, RuntimeError, OSError) as exc:
+        fail_scan(entry, exc)
+        status_slot.error("Scan failed")
+        progress_slot.empty()
+        with progress_slot.container():
+            render_activity(entry)
+            st.error(f"Research failed: {entry['error']}")
+
+
+def render_conversation(entry: dict) -> None:
+    with st.chat_message("user"):
+        st.write(entry["thesis"])
+    with st.chat_message("assistant"):
+        if entry["status"] == "running":
+            render_activity(entry, live=True)
+        elif entry["status"] == "failed":
+            render_activity(entry)
+            st.error(f"Research failed: {entry.get('error', 'Unknown error')}")
+        elif entry.get("report"):
+            with st.expander("Research activity", expanded=False):
+                render_activity(entry)
+            render_report(entry["report"], entry["id"])
+
+
+def inject_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .block-container {max-width: 1120px; padding-top: 2rem; padding-bottom: 4rem;}
+        [data-testid="stSidebar"] {border-right: 1px solid rgba(128,128,128,.18);}
+        [data-testid="stChatMessage"] {padding: 1.15rem 1.25rem; border-radius: 14px; margin-bottom: .75rem;}
+        h1, h2, h3, h4 {letter-spacing: -.02em;}
+        </style>
+        """, unsafe_allow_html=True,
     )
-    st.button("✨ Enhance with AI", on_click=enhance_thesis, use_container_width=True)
 
-    if st.session_state["enhance_error"]:
-        st.error(st.session_state["enhance_error"])
-    if st.session_state["enhanced"]:
-        with st.expander("Enhanced criteria details"):
-            st.json(st.session_state["enhanced"])
 
-    st.divider()
-    st.subheader("Data Collection")
+def main() -> None:
+    st.set_page_config(
+        page_title="ArabiAgent | Investment Research",
+        page_icon=":material/finance_mode:",
+        layout="wide",
+    )
+    initialize_state()
+    inject_styles()
+    with st.sidebar:
+        st.subheader("Conversation history")
+        if st.session_state["conversations"]:
+            for number, conversation in enumerate(
+                reversed(st.session_state["conversations"]), 1
+            ):
+                title = conversation["thesis"].strip().replace("\n", " ")
+                st.caption(f"{number}. {title[:72]}")
+        else:
+            st.caption("No research conversations yet")
 
-    with st.form("investment_scan_form"):
+    st.title("ArabiAgent")
+    st.caption("Investment research powered by sourced company analysis")
+    with st.container(border=True):
+        st.subheader("Investment thesis")
+        st.text_area(
+            "Investment thesis",
+            key="thesis",
+            height=160,
+            max_chars=3000,
+            placeholder=(
+                "Describe the startups you want to research, including geography, "
+                "industry, funding stage, revenue, and other requirements."
+            ),
+            label_visibility="collapsed",
+        )
+        st.subheader("Research Attributes")
         selected = st.multiselect(
-            "Select Startup Attributes",
-            options=PRESET_ATTRIBUTES,
-            default=[
-                "Company Name",
-                "Website",
-                "Founders",
-                "Year Founded",
-                "Funding Stage",
-                "Headquarters",
-            ],
+            "Research Attributes",
+            PRESET_ATTRIBUTES,
+            key="research_attributes",
+            accept_new_options=True,
+            on_change=normalize_attribute_tags,
+            placeholder="Select presets or type custom attributes",
+            help=(
+                "Select predefined attributes or type your own. Paste comma-separated "
+                "values to add multiple custom attributes, up to 20."
+            ),
+            label_visibility="collapsed",
         )
-        custom_input = st.text_input(
-            "Additional Custom Attributes",
-            placeholder="Saudi market presence, ARR growth, Enterprise customers",
-            help="Maximum 20 comma-separated custom attributes.",
-        )
-        limit = st.number_input(
-            "Maximum Startups", min_value=1, max_value=20, value=5, step=1
-        )
-        submitted = st.form_submit_button(
-            "🚀 Start Investment Scan", use_container_width=True
-        )
+        setting_col, action_col = st.columns([1, 2])
+        with setting_col:
+            limit = st.number_input("Maximum startups", 1, 20, 5, 1)
+        with action_col:
+            st.write("")
+            submitted = st.button("Run Research", type="primary", width="stretch")
 
-with right:
-    st.subheader("Investment Research Results")
+    for entry in st.session_state["conversations"]:
+        render_conversation(entry)
 
     if submitted:
         thesis = st.session_state["thesis"].strip()
-        attributes, error = validate_scan(thesis, selected, custom_input)
+        attributes, error = validate_scan(thesis, selected)
         if error:
             st.error(error)
         else:
-            run_streamed_scan(
-                {
-                    "thesis": thesis,
-                    "limit": int(limit),
-                    "attributes": attributes,
-                }
-            )
-    elif st.session_state["scan_history"]:
-        with st.expander("Previous Scan Activity", expanded=False):
-            st.text("\n".join(st.session_state["scan_history"]))
+            payload = {"thesis": thesis, "limit": int(limit), "attributes": attributes}
+            entry = create_scan_entry(payload)
+            st.session_state["conversations"].append(entry)
+            with st.chat_message("user"):
+                st.write(entry["thesis"])
+            with st.chat_message("assistant"):
+                status_slot = st.empty()
+                run_streamed_scan(entry, status_slot)
+                if entry.get("report"):
+                    render_report(entry["report"], entry["id"])
+            if entry["status"] == "completed":
+                status_slot.success("Research completed")
 
-    if st.session_state["report"]:
-        render_report(st.session_state["report"])
-    elif not submitted:
-        if st.session_state["scan_error"]:
-            st.error("The previous scan failed: " + st.session_state["scan_error"])
-        else:
-            st.info(
-                "Your startup research results will appear here "
-                "after running an investment scan."
-            )
+if __name__ == "__main__":
+    main()

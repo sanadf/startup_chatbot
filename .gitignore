@@ -11,3 +11,7 @@ htmlcov/
 .DS_Store
 .streamlit/secrets.toml
 *.log
+*.backup
+arabiagent-*.pdf
+arabiagent-*.json
+reports/

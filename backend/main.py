@@ -219,6 +219,11 @@ async def stream_investment_research(request: ResearchRequest):
             {"message": "Scanning the startup market..."},
         )
 
+        yield format_sse(
+            "discovery_started",
+            {"message": "Discovering startups through Linkup."},
+        )
+
         try:
             async for mode, chunk in research_graph.astream(
                 {
@@ -288,6 +293,11 @@ async def stream_investment_research(request: ResearchRequest):
                                     "error": profile.error,
                                 },
                             )
+
+            yield format_sse(
+                "report_generation_started",
+                {"message": "Generating the investment report."},
+            )
 
             report = ResearchResponse(
                 thesis=request.thesis,
