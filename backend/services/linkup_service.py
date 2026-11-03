@@ -1,10 +1,10 @@
-from linkup import Client
-from backend.models.schemas import Startup
 import asyncio
 import logging
 import os
-from backend.models.schemas import ResearchFact
+
 from linkup import Client, LinkupNoResultError
+
+from backend.models.schemas import ResearchFact, Startup
 
 STARTUP_SCHEMA = {
     "type": "object",

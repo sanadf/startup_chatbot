@@ -3,12 +3,12 @@ import asyncio
 import json
 import os
 
-from crewai import Agent, Crew, LLM, Process, Task
+from crewai import LLM, Agent, Crew, Process, Task
 
 from backend.models.schemas import (
-    Startup,
-    ResearchFact,
     AnalystReview,
+    ResearchFact,
+    Startup,
 )
 
 # Limit local Ollama workload on the Mac.
@@ -27,7 +27,7 @@ async def review_company(
             "OLLAMA_BASE_URL",
             "http://127.0.0.1:11434/v1",
         ),
-        api_key="ollama",
+        api_key=os.getenv("LOCAL_LLM_API_KEY", "ollama"),
         temperature=0.1,
     )
 

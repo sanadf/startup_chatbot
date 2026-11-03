@@ -1,7 +1,7 @@
 
 import os
 
-from crewai import Agent, Crew, LLM, Process, Task
+from crewai import LLM, Agent, Crew, Process, Task
 
 from backend.models.schemas import EnhancedThesis
 
@@ -14,7 +14,7 @@ async def enhance_thesis(thesis: str) -> EnhancedThesis:
             "OLLAMA_BASE_URL",
             "http://127.0.0.1:11434/v1",
         ),
-        api_key="ollama",
+        api_key=os.getenv("LOCAL_LLM_API_KEY", "ollama"),
         temperature=0.1,
     )
 

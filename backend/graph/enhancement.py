@@ -1,7 +1,7 @@
 
-from typing import TypedDict, NotRequired
+from typing import NotRequired, TypedDict
 
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import END, START, StateGraph
 
 from backend.agents.thesis_agent import enhance_thesis
 

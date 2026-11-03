@@ -1,10 +1,7 @@
 import json
 import logging
 import os
-from backend.services.qualification_service import (
-    assess_funding_stage,
-    extract_requested_stages,
-)
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,15 +10,30 @@ from fastapi.responses import StreamingResponse
 from backend.graph.enhancement import enhancement_graph
 from backend.graph.workflow import investment_graph, research_graph
 from backend.models.schemas import (
+    ChatReply,
+    ChatRequest,
+    CompanyContext,
     CompanyResearch,
     DiscoveryRequest,
     DiscoveryResponse,
-    EnhanceRequest,
     EnhancedThesis,
+    EnhanceRequest,
     ResearchRequest,
     ResearchResponse,
     Startup,
 )
+from backend.services.answer_service import (
+    answer_followup,
+    compare_companies,
+    knowledge_answer,
+    suggestions_for,
+)
+from backend.services.intent_service import classify
+from backend.services.qualification_service import (
+    assess_funding_stage,
+    extract_requested_stages,
+)
+from backend.services.smalltalk_service import offtopic_reply
 
 load_dotenv()
 
@@ -333,4 +345,127 @@ async def stream_investment_research(request: ResearchRequest):
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+META_REPLY = (
+    "I am an investment sourcing analyst. I can do two things:\n\n"
+    "1. **Source startups** — describe an investment thesis (sector, geography, "
+    "funding stage, revenue) and I will research matching companies and build a "
+    "downloadable report.\n"
+    "2. **Answer follow-ups** — once a report exists, ask me about any company in "
+    "it: founders, CEO, LinkedIn, funding rounds, investors, revenue, headcount "
+    "or risks. I cite a source for every fact.\n\n"
+    "Try one of the prompts below to get started."
+)
+
+CLARIFY_REPLY = (
+    "I am not sure whether you want a new startup scan or a detail about a "
+    "company already in the report.\n\n"
+    "For a scan, include the sector, geography and funding stage, for example "
+    "*\"Series A fintech startups in Saudi Arabia\"*. For a follow-up, name the "
+    "company, for example *\"Who are the founders of Tamara?\"*"
+)
+
+
+def ambiguous_company_reply(companies: list[CompanyContext]) -> str:
+    names = ", ".join(company.name for company in companies[:10])
+    return (
+        "Which company do you mean? The current report covers: "
+        f"{names}.\n\nName one, or say \"the first one\"."
+    )
+
+
+@app.post("/api/chat", response_model=ChatReply)
+async def chat(request: ChatRequest):
+    """Route one conversational turn: scan, follow-up, comparison or redirect."""
+    companies = request.context
+    names = [company.name for company in companies]
+    intent, company_name = classify(request.message, names)
+    suggestions = suggestions_for(companies)
+
+    if intent == "research":
+        return ChatReply(
+            intent="research",
+            message="",
+            suggestions=suggestions,
+        )
+
+    if intent == "meta":
+        return ChatReply(
+            intent="meta",
+            message=META_REPLY,
+            suggestions=suggestions,
+        )
+
+    if intent == "offtopic":
+        return ChatReply(
+            intent="offtopic",
+            message=offtopic_reply(request.message),
+            suggestions=suggestions,
+        )
+
+    if intent == "knowledge":
+        message, sources = await knowledge_answer(request.message)
+        return ChatReply(
+            intent="knowledge",
+            message=message,
+            sources=sources,
+            suggestions=suggestions,
+        )
+
+    if intent == "compare":
+        message, sources = compare_companies(request.message, companies)
+        return ChatReply(
+            intent="compare",
+            message=message,
+            sources=sources,
+            suggestions=suggestions,
+        )
+
+    if intent == "followup":
+        if company_name is None:
+            # Stay on the company the conversation is already about, so
+            # "who is the founder?" needs no repeated name.
+            focused = next(
+                (item for item in companies if item.name == request.focus),
+                None,
+            )
+
+            if focused is not None:
+                company_name = focused.name
+            elif len(companies) == 1:
+                company_name = companies[0].name
+            else:
+                return ChatReply(
+                    intent="clarify",
+                    message=ambiguous_company_reply(companies),
+                    suggestions=suggestions,
+                )
+
+        selected = next(
+            (item for item in companies if item.name == company_name),
+            None,
+        )
+
+        if selected is None:
+            return ChatReply(
+                intent="clarify",
+                message=ambiguous_company_reply(companies),
+                suggestions=suggestions,
+            )
+
+        message, sources = await answer_followup(request.message, selected)
+        return ChatReply(
+            intent="followup",
+            message=message,
+            company=selected.name,
+            sources=sources,
+            suggestions=suggestions,
+        )
+
+    return ChatReply(
+        intent="clarify",
+        message=CLARIFY_REPLY,
+        suggestions=suggestions,
     )
