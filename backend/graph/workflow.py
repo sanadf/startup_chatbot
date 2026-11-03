@@ -1,12 +1,16 @@
-import os
 import logging
-from backend.agents.research_agent import review_company
-from typing import TypedDict, NotRequired
+import operator
+import os
+from typing import Annotated, NotRequired, TypedDict
 
-from langgraph.graph import StateGraph, START, END
-
-from backend.services.linkup_service import discover_startups
 from langgraph.config import get_stream_writer
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
+
+from backend.agents.research_agent import review_company
+from backend.models.schemas import CompanyResearch, ResearchFact, Startup
+from backend.services.linkup_service import discover_startups, research_startup
+
 
 class InvestmentState(TypedDict):
     thesis: str
@@ -35,18 +39,6 @@ builder.add_edge(START, "discover_startups")
 builder.add_edge("discover_startups", END)
 
 investment_graph = builder.compile()
-
-import operator
-from typing import Annotated
-
-from langgraph.types import Send
-
-from backend.models.schemas import (
-    Startup,
-    ResearchFact,
-    CompanyResearch,
-)
-from backend.services.linkup_service import research_startup
 
 
 class ResearchState(InvestmentState):

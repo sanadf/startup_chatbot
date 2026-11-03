@@ -1,0 +1,15 @@
+[client]
+# Hide the Deploy button and the running/status indicator in the top bar.
+toolbarMode = "minimal"
+showErrorDetails = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
+primaryColor = "#7C3AED"
+backgroundColor = "#0B0B0F"
+secondaryBackgroundColor = "#121218"
+textColor = "#ECECF1"
+font = "sans serif"

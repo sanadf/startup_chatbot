@@ -11,7 +11,6 @@ from frontend.app import (
 )
 from frontend.chat_state import create_scan_entry
 
-
 THESIS = "Series A healthcare AI startups operating in Saudi Arabia"
 
 

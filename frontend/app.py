@@ -1,4 +1,4 @@
-"""Conversational Streamlit interface for ArabiAgent."""
+"""Conversational Streamlit interface for Startup Chatbot."""
 
 from __future__ import annotations
 
@@ -10,13 +10,41 @@ import streamlit as st
 from dotenv import load_dotenv
 
 try:
-    from frontend.chat_state import apply_scan_event, create_scan_entry, fail_scan, report_json
+    from frontend.chat_state import (
+        apply_scan_event,
+        assistant_message,
+        chat_history,
+        conversation_title,
+        create_conversation,
+        create_scan_entry,
+        fail_scan,
+        latest_context,
+        random_starters,
+        report_json,
+        report_message,
+        user_message,
+    )
     from frontend.pdf_report import build_investment_pdf
     from frontend.sse_client import iter_research_events
+    from frontend.theme import inject_styles, render_hero
 except ModuleNotFoundError:  # `streamlit run frontend/app.py`
-    from chat_state import apply_scan_event, create_scan_entry, fail_scan, report_json
+    from chat_state import (
+        apply_scan_event,
+        assistant_message,
+        chat_history,
+        conversation_title,
+        create_conversation,
+        create_scan_entry,
+        fail_scan,
+        latest_context,
+        random_starters,
+        report_json,
+        report_message,
+        user_message,
+    )
     from pdf_report import build_investment_pdf
     from sse_client import iter_research_events
+    from theme import inject_styles, render_hero
 
 load_dotenv()
 API_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
@@ -35,11 +63,74 @@ DEFAULT_ATTRIBUTES = [
 
 def initialize_state() -> None:
     for key, default in {
-        "thesis": "", "research_attributes": DEFAULT_ATTRIBUTES,
+        "research_attributes": DEFAULT_ATTRIBUTES,
         "conversations": [],
+        "active_id": "",
+        "messages": [],
+        "pending": None,
+        "last_thesis": "",
+        "focus_company": "",
+        "starters": random_starters(),
+        "limit": 5,
     }.items():
         if key not in st.session_state:
             st.session_state[key] = default
+
+    if not st.session_state["conversations"]:
+        conversation = create_conversation()
+        st.session_state["conversations"].append(conversation)
+        activate_conversation(conversation)
+
+
+def active_conversation() -> dict | None:
+    return next(
+        (
+            conversation
+            for conversation in st.session_state["conversations"]
+            if conversation["id"] == st.session_state["active_id"]
+        ),
+        None,
+    )
+
+
+def activate_conversation(conversation: dict) -> None:
+    """Make one conversation current, parking the state of the previous one.
+
+    `messages` stays the very same list object the conversation holds, so every
+    append elsewhere in the app lands in the right thread with no extra syncing.
+    """
+    current = active_conversation()
+    if current is not None and current is not conversation:
+        current["last_thesis"] = st.session_state.get("last_thesis", "")
+        current["focus_company"] = st.session_state.get("focus_company", "")
+
+    st.session_state["active_id"] = conversation["id"]
+    st.session_state["messages"] = conversation["messages"]
+    st.session_state["last_thesis"] = conversation["last_thesis"]
+    st.session_state["focus_company"] = conversation["focus_company"]
+    st.session_state["pending"] = None
+
+
+def start_new_conversation() -> None:
+    conversation = create_conversation()
+    st.session_state["conversations"].append(conversation)
+    activate_conversation(conversation)
+    st.session_state["starters"] = random_starters()
+    st.rerun()
+
+
+def delete_active_conversation() -> None:
+    """Drop the current thread; the sidebar always keeps at least one open."""
+    conversations = st.session_state["conversations"]
+    current = active_conversation()
+    if current is not None:
+        conversations.remove(current)
+    st.session_state["active_id"] = ""
+    if not conversations:
+        conversations.append(create_conversation())
+    activate_conversation(conversations[-1])
+    st.session_state["starters"] = random_starters()
+    st.rerun()
 
 
 def split_attribute_values(values: list[str]) -> list[str]:
@@ -132,22 +223,46 @@ def comparison_rows(report: dict) -> list[dict]:
     return rows
 
 
-def render_report(report: dict, entry_id: str) -> None:
-    results = report.get("results", []) or []
-    successful = sum(isinstance(item, dict) and not item.get("error") for item in results)
-    failed = len(results) - successful
-    matches = sum(
-        isinstance(item, dict) and item.get("stage_status") == "match"
+def report_opening(report: dict) -> str:
+    """The sentence that opens a report, the way a person would say it."""
+    results = [item for item in report.get("results", []) or [] if isinstance(item, dict)]
+    names = [
+        (item.get("company") or {}).get("name") or "an unnamed company"
         for item in results
-    )
-    st.markdown("### Investment research report")
-    st.markdown("#### Executive overview")
-    st.markdown(f"**Original investment thesis**  \n{report.get('thesis', 'Not specified')}")
-    metric_cols = st.columns(4)
-    metric_cols[0].metric("Researched", len(results))
-    metric_cols[1].metric("Completed", successful)
-    metric_cols[2].metric("Incomplete", failed)
-    metric_cols[3].metric("Funding matches", matches)
+    ]
+
+    if not names:
+        return (
+            "I could not find any companies matching that thesis. "
+            "Try widening the sector, geography or funding stage."
+        )
+
+    if len(names) == 1:
+        listed = f"**{names[0]}**"
+    else:
+        listed = ", ".join(f"**{name}**" for name in names[:-1])
+        listed += f" and **{names[-1]}**"
+
+    noun = "company" if len(names) == 1 else "companies"
+    opening = f"I found {len(names)} {noun} matching your thesis: {listed}."
+
+    incomplete = [
+        (item.get("company") or {}).get("name") or "one company"
+        for item in results
+        if item.get("error")
+    ]
+    if incomplete:
+        opening += (
+            f" Research came back incomplete for {', '.join(incomplete)}, "
+            "so some fields are missing."
+        )
+
+    return opening
+
+
+def render_report(report: dict, entry_id: str) -> None:
+    st.markdown(report_opening(report))
+    results = report.get("results", []) or []
 
     st.markdown("#### Startup comparison")
     rows = comparison_rows(report)
@@ -223,14 +338,14 @@ def render_report(report: dict, entry_id: str) -> None:
     try:
         pdf_col.download_button(
             "Download PDF Report", data=build_investment_pdf(report),
-            file_name=f"arabiagent-{entry_id[:8]}.pdf", mime="application/pdf",
+            file_name=f"startup-report-{entry_id[:8]}.pdf", mime="application/pdf",
             width="stretch", key=f"pdf-{entry_id}",
         )
     except Exception as exc:
         pdf_col.warning(f"PDF export could not be generated: {exc}")
     json_col.download_button(
         "Download JSON Report", data=report_json(report),
-        file_name=f"arabiagent-{entry_id[:8]}.json", mime="application/json",
+        file_name=f"startup-report-{entry_id[:8]}.json", mime="application/json",
         width="stretch", key=f"json-{entry_id}",
     )
     st.caption(
@@ -239,144 +354,239 @@ def render_report(report: dict, entry_id: str) -> None:
     )
 
 
-def render_activity(entry: dict, live: bool = False) -> None:
-    events = entry.get("events", [])
-    if events:
-        for item in events:
-            st.write(item.get("message", ""))
-    elif live:
-        st.write("Connecting to the research service…")
+def progress_label(entry: dict) -> str:
+    """One plain sentence describing where the scan has reached."""
+    completed = entry.get("completed", 0)
+    total = entry.get("discovered", 0)
+
+    if total and completed:
+        return f"Researching companies… {completed} of {total} done"
+    if total:
+        return f"Found {total} companies. Researching each one…"
+    return "Searching for companies that match your thesis…"
 
 
 def run_streamed_scan(entry: dict, status_slot) -> None:
     """Consume one SSE stream and update only its conversation entry."""
-    progress_slot = st.empty()
     try:
         for event, data in iter_research_events(API_URL, entry["request"]):
             apply_scan_event(entry, event, data)
-            latest = entry["events"][-1]["message"] if entry["events"] else "Researching"
-            status_slot.info(latest)
-            progress_slot.empty()
-            with progress_slot.container():
-                render_activity(entry, live=True)
+            status_slot.markdown(f":gray[{progress_label(entry)}]")
         if entry["status"] == "running":
             raise RuntimeError("Stream ended without a final report")
         if entry["status"] == "failed":
-            status_slot.error("Scan failed")
+            status_slot.empty()
             st.error(f"Research failed: {entry['error']}")
     except (httpx.HTTPError, ValueError, RuntimeError, OSError) as exc:
         fail_scan(entry, exc)
-        status_slot.error("Scan failed")
-        progress_slot.empty()
-        with progress_slot.container():
-            render_activity(entry)
-            st.error(f"Research failed: {entry['error']}")
+        status_slot.empty()
+        st.error(f"Research failed: {entry['error']}")
 
 
-def render_conversation(entry: dict) -> None:
-    with st.chat_message("user"):
-        st.write(entry["thesis"])
-    with st.chat_message("assistant"):
-        if entry["status"] == "running":
-            render_activity(entry, live=True)
-        elif entry["status"] == "failed":
-            render_activity(entry)
-            st.error(f"Research failed: {entry.get('error', 'Unknown error')}")
-        elif entry.get("report"):
-            with st.expander("Research activity", expanded=False):
-                render_activity(entry)
-            render_report(entry["report"], entry["id"])
 
 
-def inject_styles() -> None:
-    st.markdown(
-        """
-        <style>
-        .block-container {max-width: 1120px; padding-top: 2rem; padding-bottom: 4rem;}
-        [data-testid="stSidebar"] {border-right: 1px solid rgba(128,128,128,.18);}
-        [data-testid="stChatMessage"] {padding: 1.15rem 1.25rem; border-radius: 14px; margin-bottom: .75rem;}
-        h1, h2, h3, h4 {letter-spacing: -.02em;}
-        </style>
-        """, unsafe_allow_html=True,
+
+def post_chat(message: str) -> dict:
+    """Route one message through the backend conversational endpoint."""
+    payload = {
+        "message": message,
+        "thesis": st.session_state.get("last_thesis", ""),
+        "context": latest_context(st.session_state["messages"]),
+        "history": chat_history(st.session_state["messages"][:-1]),
+        "focus": st.session_state.get("focus_company", ""),
+    }
+    response = httpx.post(
+        f"{API_URL}/api/chat",
+        json=payload,
+        timeout=httpx.Timeout(120.0, connect=10.0),
     )
+    response.raise_for_status()
+    return response.json()
 
 
-def main() -> None:
-    st.set_page_config(
-        page_title="ArabiAgent | Investment Research",
-        page_icon=":material/finance_mode:",
-        layout="wide",
-    )
-    initialize_state()
-    inject_styles()
-    with st.sidebar:
-        st.subheader("Conversation history")
-        if st.session_state["conversations"]:
-            for number, conversation in enumerate(
-                reversed(st.session_state["conversations"]), 1
-            ):
-                title = conversation["thesis"].strip().replace("\n", " ")
-                st.caption(f"{number}. {title[:72]}")
+def render_sources(sources: list[str]) -> None:
+    if not sources:
+        return
+    with st.expander("Sources", expanded=False):
+        for url in sources:
+            st.markdown(f"- [{url}]({url})")
+
+
+def render_message(message: dict) -> None:
+    with st.chat_message(message["role"]):
+        if message.get("kind") == "report":
+            entry = message["entry"]
+            if entry["status"] == "failed":
+                st.error(f"Research failed: {entry.get('error', 'Unknown error')}")
+            elif entry.get("report"):
+                render_report(entry["report"], entry["id"])
+            else:
+                st.markdown(f":gray[{progress_label(entry)}]")
         else:
-            st.caption("No research conversations yet")
+            st.markdown(message["text"])
+            render_sources(message.get("sources", []))
 
-    st.title("ArabiAgent")
-    st.caption("Investment research powered by sourced company analysis")
-    with st.container(border=True):
-        st.subheader("Investment thesis")
-        st.text_area(
-            "Investment thesis",
-            key="thesis",
-            height=160,
-            max_chars=3000,
-            placeholder=(
-                "Describe the startups you want to research, including geography, "
-                "industry, funding stage, revenue, and other requirements."
-            ),
-            label_visibility="collapsed",
+
+def queue_message(text: str) -> None:
+    st.session_state["messages"].append(user_message(text))
+    st.session_state["pending"] = text
+
+
+def start_research(thesis: str) -> None:
+    """Kick off a streamed scan and keep its report in the conversation."""
+    attributes, error = validate_scan(thesis, st.session_state["research_attributes"])
+    if error:
+        st.session_state["messages"].append(
+            assistant_message(
+                f"I could not start the scan: {error} "
+                "Adjust the research attributes in the sidebar and try again."
+            )
         )
-        st.subheader("Research Attributes")
-        selected = st.multiselect(
-            "Research Attributes",
+        return
+
+    st.session_state["last_thesis"] = thesis
+    st.session_state["focus_company"] = ""
+    payload = {
+        "thesis": thesis,
+        "limit": int(st.session_state["limit"]),
+        "attributes": attributes,
+    }
+    entry = create_scan_entry(payload)
+    st.session_state["messages"].append(report_message(entry))
+
+    status_slot = st.empty()
+    run_streamed_scan(entry, status_slot)
+    status_slot.empty()
+
+
+def handle_pending() -> None:
+    """Process the queued user message and append the assistant turn."""
+    message = st.session_state.pop("pending")
+
+    with st.chat_message("assistant"):
+        thinking = st.empty()
+        thinking.info("Routing your request…")
+        try:
+            reply = post_chat(message)
+        except (httpx.HTTPError, ValueError, OSError) as exc:
+            thinking.empty()
+            st.session_state["messages"].append(
+                assistant_message(
+                    f"I could not reach the research service: {exc}"
+                )
+            )
+            return
+
+        thinking.empty()
+
+        if reply.get("company"):
+            st.session_state["focus_company"] = reply["company"]
+
+        if reply.get("intent") == "research":
+            start_research(message)
+        else:
+            st.session_state["messages"].append(
+                assistant_message(
+                    reply.get("message", ""),
+                    reply.get("sources", []),
+                )
+            )
+            st.markdown(reply.get("message", ""))
+            render_sources(reply.get("sources", []))
+
+
+def render_settings() -> None:
+    """Optional scan settings, tucked away next to the prompt box."""
+    with st.expander("Research settings (optional)", expanded=False):
+        st.multiselect(
+            "Research attributes",
             PRESET_ATTRIBUTES,
             key="research_attributes",
             accept_new_options=True,
             on_change=normalize_attribute_tags,
             placeholder="Select presets or type custom attributes",
             help=(
-                "Select predefined attributes or type your own. Paste comma-separated "
-                "values to add multiple custom attributes, up to 20."
+                "Attributes collected for every company in a new scan. Paste "
+                "comma-separated values to add several custom attributes."
             ),
-            label_visibility="collapsed",
         )
-        setting_col, action_col = st.columns([1, 2])
-        with setting_col:
-            limit = st.number_input("Maximum startups", 1, 20, 5, 1)
-        with action_col:
-            st.write("")
-            submitted = st.button("Run Research", type="primary", width="stretch")
+        st.number_input("Maximum startups per scan", 1, 20, key="limit", step=1)
 
-    for entry in st.session_state["conversations"]:
-        render_conversation(entry)
 
-    if submitted:
-        thesis = st.session_state["thesis"].strip()
-        attributes, error = validate_scan(thesis, selected)
-        if error:
-            st.error(error)
-        else:
-            payload = {"thesis": thesis, "limit": int(limit), "attributes": attributes}
-            entry = create_scan_entry(payload)
-            st.session_state["conversations"].append(entry)
-            with st.chat_message("user"):
-                st.write(entry["thesis"])
-            with st.chat_message("assistant"):
-                status_slot = st.empty()
-                run_streamed_scan(entry, status_slot)
-                if entry.get("report"):
-                    render_report(entry["report"], entry["id"])
-            if entry["status"] == "completed":
-                status_slot.success("Research completed")
+def render_suggestions() -> None:
+    """Starter prompts, shown as cards only before the conversation begins."""
+    prompts = st.session_state["starters"][:3]
+    for column, prompt in zip(st.columns(len(prompts)), prompts):
+        if column.button(prompt, key=f"suggest-{prompt}", width="stretch"):
+            queue_message(prompt)
+            st.rerun()
+
+
+def render_sidebar() -> None:
+    with st.sidebar:
+        st.markdown(
+            '<div class="sc-brand">'
+            '<div class="sc-brand__mark"></div>'
+            '<div class="sc-brand__name">Startup Chatbot</div>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        if st.button(
+            "New research conversation",
+            icon=":material/edit_square:",
+            width="stretch",
+        ):
+            start_new_conversation()
+
+        st.markdown('<div class="sc-group-label">Recent</div>', unsafe_allow_html=True)
+        for conversation in reversed(st.session_state["conversations"]):
+            is_active = conversation["id"] == st.session_state["active_id"]
+            if st.button(
+                conversation_title(conversation),
+                key=f"conv-{conversation['id']}",
+                type="primary" if is_active else "tertiary",
+                width="stretch",
+            ):
+                activate_conversation(conversation)
+                st.rerun()
+
+        st.divider()
+        if st.button("Delete conversation", icon=":material/delete:", width="stretch"):
+            delete_active_conversation()
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Startup Chatbot | Investment Research",
+        page_icon=":material/finance_mode:",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    initialize_state()
+    inject_styles()
+    render_sidebar()
+
+    if not st.session_state["messages"]:
+        render_hero()
+
+    for message in st.session_state["messages"]:
+        render_message(message)
+
+    if st.session_state.get("pending"):
+        handle_pending()
+        st.rerun()
+
+    if not st.session_state["messages"]:
+        render_suggestions()
+
+    render_settings()
+
+    prompt = st.chat_input("Describe a thesis, or ask about a company…")
+    if prompt and prompt.strip():
+        queue_message(prompt.strip())
+        st.rerun()
+
 
 if __name__ == "__main__":
     main()

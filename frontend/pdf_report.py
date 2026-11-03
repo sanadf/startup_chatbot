@@ -1,16 +1,14 @@
-"""Generate investment PDFs from existing ArabiAgent reports."""
-from datetime import datetime, timezone
+"""Generate investment PDFs from existing Startup Chatbot reports."""
+from datetime import UTC, datetime
 from html import escape
 from io import BytesIO
 from urllib.parse import urlparse
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-)
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 
 def build_investment_pdf(report: dict) -> bytes:
@@ -73,13 +71,13 @@ def build_investment_pdf(report: dict) -> bytes:
     )
 
     story = [
-        para("ArabiAgent Investment Report", "InvestmentTitle"),
+        para("Startup Chatbot Investment Report", "InvestmentTitle"),
         Spacer(1, 8),
         para("Investment thesis", "InvestmentSection"),
         para(report.get("thesis", "Not specified")),
         Spacer(1, 8),
         para(
-            f"Generated {datetime.now(timezone.utc):%d %b %Y} (UTC)",
+            f"Generated {datetime.now(UTC):%d %b %Y} (UTC)",
             "InvestmentSmall"
         ),
         para("Executive summary", "InvestmentSection"),
@@ -220,7 +218,7 @@ def build_investment_pdf(report: dict) -> bytes:
         canvas.setFillColor(colors.grey)
         canvas.drawString(
             18*mm, 12*mm,
-            "ArabiAgent | Investment Research"
+            "Startup Chatbot | Investment Research"
         )
         canvas.drawRightString(
             A4[0]-18*mm, 12*mm,

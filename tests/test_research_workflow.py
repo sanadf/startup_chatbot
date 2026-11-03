@@ -4,7 +4,7 @@ import asyncio
 import pytest
 
 from backend.graph import workflow
-from backend.models.schemas import Startup, ResearchFact
+from backend.models.schemas import ResearchFact, Startup
 
 
 @pytest.mark.asyncio
